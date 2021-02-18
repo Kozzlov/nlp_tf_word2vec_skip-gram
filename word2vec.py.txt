@@ -1,0 +1,262 @@
+!pip install -q tqdm
+
+import io 
+import itertools
+import numpy as np 
+import os 
+import re
+import string 
+import tensorflow as tf
+import tqdm
+
+from tensorflow.keras import Model, Sequential 
+from tensorflow.keras.layers import Activation, Dense, Dot, Embedding, Flatten, GlobalAveragePooling1D, Reshape
+from tensorflow.keras.layers.experimental.preprocessing import TextVectorization
+
+SEED = 42 
+AUTOTUNE = tf.data.AUTOTUNE
+
+#Consider the following sentence
+sentence = "The wide road shimmered in the hot sun"
+tokens = list (sentence.lower().split())
+print(len(tokens))
+#Create a vocabulary to save mappings from tokens to integer indices
+vocab, index = {}, 1 #start index form 1
+vocab['<pad>'] = 0 # add a padding token 
+for token in tokens:
+  if token not in vocab:
+    vocab[token] = index 
+    index += 1
+vocab_size = len(vocab)
+print(vocab)
+#Create an inverse vocabulary to save mappings from integer indices to tokens
+inverse_vocab = {index: token for token, index in vocab.items()}
+print(inverse_vocab)
+#Vectorize the sentense 
+example_sequence = [vocab[word] for word in tokens]
+print(example_sequence)
+#(Generate skip-grams)
+#Skip-gram is one of the unsupervised learning techniques used to find the most related words for a given word
+window_size = 2
+positive_skip_grams, _ = tf.keras.preprocessing.sequence.skipgrams(
+    example_sequence, 
+    vocabulary_size=vocab_size, 
+    window_size=window_size,
+    negative_samples=0)
+print(len(positive_skip_grams))
+
+#for target, context in positive_skip_grams[:5]:
+#print(f"({target}, {context}): ({inverse_vocab[target]}, {inverse_vocab[context]})")
+
+#Negative sampling for one skip-gram
+#Get target and context words for one positive skip-gram
+target_word, context_word = positive_skip_grams[0]
+#Set the number of negative samples per positive context
+num_ns = 4
+
+context_class = tf.reshape(tf.constant(context_word, dtype="int64"), (1, 1))
+negative_sampling_candidates, _, _ = tf.random.log_uniform_candidate_sampler(
+    true_classes=context_class,#classes that sould be sampled as positive
+    num_true=1,#each posistive skip-gram has one positive context class 
+    num_sampled=num_ns,#number of negative context words to sample
+    unique=True,#all the negative samples must be unique
+    range_max=vocab_size,#index from the sample, from [0, vocab_size]
+    seed=SEED,#seed for reproducibility
+    name="negative_sampling"#name of this operation
+)
+
+print(negative_sampling_candidates)
+print([inverse_vocab[index.numpy()] for index in negative_sampling_candidates])
+
+#creating a training example 
+#adding a dimention so to use concatination (on the next step)
+negative_sampling_candidates = tf.expand_dims(negative_sampling_candidates, 1)
+#concatting positive and negative sampled words
+context = tf.concat([context_class, negative_sampling_candidates], 0)
+#label first context word as 1 (positive) followed ny num_ns 0s (negative)
+label=tf.constant([1]+ [0]*num_ns, dtype="int64")
+#reshaping target to shape (1,) and context label to (num_ns+1,)
+target=tf.squeeze(target_word)
+context=tf.squeeze(context)
+label=tf.squeeze(label)
+
+# print(f"target_index    : {target}")
+# print(f"target_word     : {inverse_vocab[target_word]}")
+# print(f"context_indices : {context}")
+# print(f"context_words   : {[inverse_vocab[c.numpy()] for c in context]}")
+# print(f"label           : {label}")
+
+# print(f"target  :", target)
+# print(f"context :", context )
+# print(f"label   :", label )
+
+#skip-gram sampling table 
+sampling_table=tf.keras.preprocessing.sequence.make_sampling_table(size=10)
+print(sampling_table)
+ 
+#generating training table
+#generate skip-gram pairs with negative sampling for the list of sequences
+#(int-encoded sentences) based on window size, number of negative samples
+#and vocabulary size
+def generate_training_data(sequences, window_size, num_ns, vocab_size, seed):
+  #elements of each training example are appended to these lists
+  targets, contexts, labels = [], [], []
+
+  #building the sampling table for vacab_size tokens
+  sampling_table = tf.keras.preprocessing.sequence.make_sampling_table(vocab_size)
+
+  #iterate over all sequences in dataset 
+  for sequence in tqdm.tqdm(sequences):
+    #generate positive skip-gram pairs for a sequence
+    positive_skip_grams, _ = tf.keras.preprocessing.sequence.skipgrams(
+        sequence,
+        vocabulary_size=vocab_size,
+        sampling_table=sampling_table,
+        window_size=window_size,
+        negative_samples=0)
+    for target_word, context_word in positive_skip_grams:
+      context_class = tf.expand_dims(
+          tf.constant([context_word], dtype="int64"), 1)
+      negative_sampling_candidates, _, _ = tf.random.log_uniform_candidate_sampler(
+          true_classes=context_class,
+          num_true=1,
+          num_sampled=num_ns,
+          unique=True,
+          range_max=vocab_size,
+          seed=SEED,
+          name="negative_sampling"
+      )
+      #building context and lable vectors (for one target word)
+      negative_sampling_candidates =tf.expand_dims(
+          negative_sampling_candidates, 1)
+      context = tf.concat([context_class, negative_sampling_candidates], 0)
+      label = tf.constant([1] + [0]*num_ns, dtype="int64")
+      
+      #append each element from the training example to the global lists 
+      targets.append(target_word)
+      contexts.append(context)
+      labels.append(label)
+
+  return targets, contexts, labels
+
+#Preparing training data for Word2Vec
+#Downloading text corpus
+path_to_file = tf.keras.utils.get_file('shakespeare.txt',
+                                       'https://storage.googleapis.com/download.tensorflow.org/data/shakespeare.txt')
+# with open(path_to_file) as f:
+#   lines = f.read().splitlines()
+# for line in lines[:20]:
+#   print(line)
+text_ds = tf.data.TextLineDataset(path_to_file).filter(lambda x: tf.cast(tf.strings.length(x), bool))
+
+#vectorize sentences from corpus
+#custom standartization function to lowercase text and remove punctuation
+def custom_standardization(input_data):
+  lowercase = tf.strings.lower(input_data)
+  return tf.strings.regex_replace(lowercase,
+                                  '[%s]' % re.escape(string.punctuation), '')
+#define the vocabulary size and number of words in a sequence
+vocab_size=4096
+sequence_length=10
+#use the text vectorization layer to normalize, split and map strings to integers
+#set output_sequence_length length to pad all samples to the same length.
+vectorize_layer = TextVectorization(
+  standardize=custom_standardization,
+  max_tokens=vocab_size,
+  output_mode='int',
+  output_sequence_length=sequence_length)
+#call adapt to create vocabulary
+vectorize_layer.adapt(text_ds.batch(1024))
+#save the created vocabulary for reference
+inverse_vocab=vectorize_layer.get_vocabulary()
+print(inverse_vocab[:20])
+#now vectorize-layer can be used to generate vectors for each alement in the text_ds
+def vectorize_text(text):
+  text=tf.expand_dims(text, -1)
+  return tf.squeeze(vectorize_layer(text))
+#vectorize the data in text_ds
+text_vector_ds=text_ds.batch(1024).prefetch(AUTOTUNE).map(vectorize_layer).unbatch()
+
+#obtain sequence from the dataset
+sequences=list(text_vector_ds.as_numpy_iterator())
+print(len(sequences))
+
+# for seq in sequences[:5]:
+#   print(f"{seq} => {[inverse_vocab[i] for i in seq]}")
+
+#generating training examples from the sequence 
+targets, contexts, labels = generate_training_data(
+    sequences=sequences,
+    window_size=2,
+    num_ns=4,
+    vocab_size=vocab_size,
+    seed=SEED)
+print(len(targets), len(contexts), len(labels))
+
+#configure the dataset for perfomance 
+BATCH_SIZE=1024
+BUFFER_SIZE=10000
+dataset=tf.data.Dataset.from_tensor_slices(((targets, contexts), labels))
+dataset=dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE, drop_remainder=True)
+print(dataset)
+
+#model and training 
+#subclassed Word2Vec model
+class Word2Vec(Model):
+  def __init__(self, vocab_size, embedding_dim):
+    super(Word2Vec, self).__init__()
+    self.target_embedding = Embedding(vocab_size,
+                                      embedding_dim,
+                                      input_length=1,
+                                      name="w2v_embedding", )
+    self.context_embedding = Embedding(vocab_size,
+                                       embedding_dim,
+                                       input_length=num_ns+1)
+    self.dots = Dot(axes=(3,2))
+    self.flatten = Flatten()
+  def call(self, pair):
+    target, context = pair
+    we = self.target_embedding(target)
+    ce = self.context_embedding(context)
+    dots = self.dots([ce, we])
+    return self.flatten(dots)
+
+#define loss function and compile model
+embedding_dim = 128
+word2vec = Word2Vec(vocab_size, embedding_dim)
+word2vec.compile(optimizer='adam',
+                 loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True),
+                 metrics=['accuracy'])
+
+#callback to log training statistics for tensorboard
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir="logs")
+
+#training the model 
+word2vec.fit(dataset, epochs=20, callbacks=[tensorboard_callback])
+
+# representing accuracy and loss with Tensorboard for Word2Vec model
+#%tensorboard --logdir logs (CHECK WHY IT DOES NOT WORK)
+
+#embedding lookup and analysis
+weights=word2vec.get_layer('w2v_embedding').get_weights()[0]
+vocab=vectorize_layer.get_vocabulary()
+
+#creating and saving the vectors metadata file
+out_v=io.open('vectors.tsv', 'w', encoding='utf-8')
+out_m=io.open('metadata.tsv', 'w', encoding='utf-8')
+
+for index, word in enumerate(vocab):
+  if index == 0: continue #skip 0, it is padding 
+  vec=weights[index]
+  out_v.write('\t'.join([str(x) for x in vec]) + "\n")
+  out_m.write(word + "\n")
+out_v.close()
+out_m.close()
+
+#downloading vectors.tsv/metadata.tsv (in order to analyze embedding in EMBEDDING PROJECTOR)
+# try:
+#   from google.colab import files
+#   files.download('vectors.tsv')
+#   files.download('metadata.tsv')
+# except Exception as e:
+#   pass
